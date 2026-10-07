@@ -1,0 +1,86 @@
+trigger: none
+schedules:
+- cron: '0 2 * * *'
+  displayName: Daily drift review (07:30 India time)
+  branches:
+    include: [main]
+  always: true
+pool:
+  vmImage: ubuntu-24.04
+variables:
+  azureServiceConnection: azure-mlops-wif
+  resourceGroup: rg-mlops-demo
+  amlWorkspace: mlops-workspace
+  imageRepository: iris-api
+stages:
+- stage: Monitoring
+  displayName: '31–38 Monitoring, logging, alerting and retraining decision'
+  condition: and(succeeded(), eq(variables['monitoringEnabled'], 'true'))
+  jobs:
+  - job: Drift
+    steps:
+    - checkout: self
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.14'
+    - script: pip install -r requirements.txt
+    - task: AzureCLI@2
+      displayName: Download deployed baseline/model and approved monitoring batch
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+          mkdir -p artifacts data
+          # Operations pins these blob names to the version currently deployed in production.
+          az storage blob download --auth-mode login --account-name "$(dataStorageAccount)" --container-name ml-data --name "$(baselineBlob)" --file artifacts/baseline.csv
+          az storage blob download --auth-mode login --account-name "$(dataStorageAccount)" --container-name ml-data --name "$(modelBlob)" --file artifacts/model.joblib
+          az storage blob download --auth-mode login --account-name "$(dataStorageAccount)" --container-name ml-data --name "$(monitoringBlob)" --file data/production.csv
+    - task: AzureCLI@2
+      displayName: '31–33 / 36 Private application, API, model and performance monitoring'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: scriptPath
+        scriptPath: scripts/deploy_cd.sh
+      env:
+        RG: $(resourceGroup)
+        ACR_NAME: $(acrName)
+        IMAGE_REPOSITORY: $(imageRepository)
+        BUILD_ID: $(productionModelVersion)
+        APP_NAME: mlops-iris-prod
+        ENVIRONMENT_NAME: monitor
+        CHECK_ONLY: 'true'
+        MONITOR_RUN_ID: $(Build.BuildId)
+    - script: python -m scripts.monitor artifacts/baseline.csv data/production.csv --model artifacts/model.joblib
+      name: drift
+      displayName: '34–35 Data drift and supervised model drift'
+    - publish: artifacts/drift.json
+      artifact: monitoring-report
+      displayName: '37 Persist drift evidence'
+- stage: RetrainingTrigger
+  displayName: '38 Trigger retraining; downstream runs stages 39–41'
+  dependsOn: Monitoring
+  condition: and(succeeded(), eq(dependencies.Monitoring.outputs['Drift.drift.retrain'], 'true'))
+  jobs:
+  - job: QueueTraining
+    pool:
+      vmImage: ubuntu-24.04
+    steps:
+    - bash: |
+        set -euo pipefail
+        python - <<'PY'
+        import json, os, urllib.request
+        body = json.dumps({'resources': {'repositories': {'self': {'refName': 'refs/heads/main'}}}, 'templateParameters': {'deploy': True, 'retrain': True}}).encode()
+        url = os.environ['COLLECTION'] + os.environ['PROJECT'] + '/_apis/pipelines/' + os.environ['PIPELINE_ID'] + '/runs?api-version=7.1'
+        req = urllib.request.Request(url, data=body, headers={'Authorization': 'Bearer ' + os.environ['TOKEN'], 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            print('Queued retraining run', json.load(response)['id'])
+        PY
+      displayName: Queue approved dataset retraining with normal quality and approval gates
+      env:
+        TOKEN: $(System.AccessToken)
+        COLLECTION: $(System.CollectionUri)
+        PROJECT: $(System.TeamProjectId)
+        PIPELINE_ID: $(trainingPipelineId)

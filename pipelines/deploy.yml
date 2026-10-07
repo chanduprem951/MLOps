@@ -1,0 +1,36 @@
+parameters:
+- name: environment
+  type: string
+- name: appName
+  type: string
+- name: title
+  type: string
+
+jobs:
+- deployment: Deploy
+  pool:
+    vmImage: ubuntu-24.04
+  displayName: ${{ parameters.title }}
+  environment: ml-${{ parameters.environment }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+        - task: AzureCLI@2
+          displayName: '19–25 Deploy immutable API/model and run private integration, API, performance and security gates'
+          inputs:
+            azureSubscription: $(azureServiceConnection)
+            scriptType: bash
+            scriptLocation: scriptPath
+            scriptPath: scripts/deploy_cd.sh
+          env:
+            RG: $(resourceGroup)
+            ACR_NAME: $(acrName)
+            IMAGE_REPOSITORY: $(imageRepository)
+            BUILD_ID: $(Build.BuildId)
+            APP_NAME: ${{ parameters.appName }}
+            ENVIRONMENT_NAME: ${{ parameters.environment }}
+        - publish: artifacts
+          condition: succeededOrFailed()
+          artifact: release-${{ parameters.environment }}

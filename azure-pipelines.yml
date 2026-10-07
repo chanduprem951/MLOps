@@ -1,0 +1,225 @@
+trigger:
+  branches:
+    include: [main]
+# Azure Repos PR validation is configured through a main branch build-validation policy.
+parameters:
+- name: provision
+  type: boolean
+  default: false
+- name: deploy
+  type: boolean
+  default: false
+- name: retrain
+  type: boolean
+  default: false
+
+pool:
+  vmImage: ubuntu-24.04
+variables:
+  azureServiceConnection: azure-mlops-wif
+  resourceGroup: rg-mlops-demo
+  amlWorkspace: mlops-workspace
+  imageRepository: iris-api
+
+stages:
+- stage: Infrastructure
+  displayName: 'Prepare private Azure CD infrastructure'
+  condition: eq('${{ lower(parameters.provision) }}', 'true')
+  jobs:
+  - ${{ if eq(parameters.provision, true) }}:
+    - job: Provision
+      timeoutInMinutes: 60
+      steps:
+      - checkout: self
+      - task: AzureCLI@2
+        displayName: Create private CD infrastructure without RBAC expansion
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          scriptType: bash
+          scriptLocation: scriptPath
+          scriptPath: scripts/provision_cd.sh
+        env:
+          ACR_NAME: $(acrName)
+          STORAGE_NAME: $(dataStorageAccount)
+          RG: $(resourceGroup)
+          LOCATION: eastus
+  - ${{ else }}:
+    - job: NotRequested
+      steps:
+      - script: echo Infrastructure provisioning was not requested.
+- stage: CI
+  dependsOn: []
+  condition: eq('${{ lower(parameters.provision) }}', 'false')
+  displayName: 'CI — stages 1–18'
+  jobs:
+  - job: BuildTrainTest
+    steps:
+    - checkout: self
+      clean: true
+      displayName: '01 Source code management'
+    - ${{ if eq(parameters.deploy, true) }}:
+      - bash: |
+          set -euo pipefail
+          for setting in "$ACR_NAME" "$DATA_STORAGE_ACCOUNT" "$RELEASE_APPROVERS"; do
+            if [[ -z "$setting" || "$setting" == *'REPLACE_'* || "$setting" == *'$('* ]]; then
+              echo '##vso[task.logissue type=error]Set acrName, dataStorageAccount and releaseApprovers in pipeline variables before deploy=true.'
+              exit 1
+            fi
+          done
+        displayName: Validate release configuration
+        env:
+          ACR_NAME: $(acrName)
+          DATA_STORAGE_ACCOUNT: $(dataStorageAccount)
+          RELEASE_APPROVERS: $(releaseApprovers)
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.14'
+    - script: pip install -r requirements-dev.txt
+      displayName: Install pinned dependencies
+    - script: ruff check .
+      displayName: '02 Code validation'
+    - ${{ if eq(parameters.retrain, true) }}:
+      - task: AzureCLI@2
+        displayName: Download approved versioned retraining data
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            mkdir -p data
+            az storage blob download --auth-mode login --account-name "$(dataStorageAccount)" --container-name ml-data --name "$(trainingBlob)" --file data/current.csv
+    - script: python -m ml.workflow data
+      displayName: '03 Data validation'
+      env:
+        REQUIRE_TRAINING_DATA: ${{ lower(parameters.retrain) }}
+    - script: pip check && pip-audit -r requirements.txt
+      displayName: '04 Dependency validation and vulnerability gate'
+    - script: python -m compileall -q app ml scripts
+      displayName: '05 Build application'
+    - script: pytest --junitxml=artifacts/unit-tests.xml
+      displayName: '06 Unit testing'
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: artifacts/unit-tests.xml
+        failTaskOnFailedTests: true
+    - script: python -m ml.workflow preprocess
+      displayName: '07 Data preprocessing'
+    - script: python -m ml.workflow features
+      displayName: '08 Feature engineering'
+    - script: python -m ml.workflow train
+      displayName: '09 Model training / 39 Model retraining'
+    - script: python -m ml.workflow evaluate
+      displayName: '10 Model evaluation'
+    - script: python -m ml.workflow validate
+      displayName: '11 Model validation'
+    - script: python -m ml.workflow gate
+      displayName: '12 Model quality gate / 40 Model versioning'
+    - script: python -c "from app.main import app; import json; open('artifacts/openapi.json','w').write(json.dumps(app.openapi()))"
+      displayName: '15 Build FastAPI application contract'
+    - script: pytest tests/test_workflow.py --junitxml=artifacts/api-tests.xml
+      displayName: '16 FastAPI API testing'
+    - script: python -m build && bandit -r app ml scripts -lll
+      displayName: '17 Package application and static security gate'
+    - script: docker build --pull -t iris-api:$(Build.BuildId) .
+      displayName: '13 Build Docker image'
+    - bash: |
+        set -euo pipefail
+        docker run -d --name mlops-smoke -p 127.0.0.1:8000:8000 iris-api:$(Build.BuildId)
+        trap 'docker logs mlops-smoke; docker rm -f mlops-smoke' EXIT
+        for attempt in $(seq 1 12); do
+          if python -m scripts.check_endpoint http://127.0.0.1:8000 smoke --version "$(Build.BuildId)"; then exit 0; fi
+          sleep 5
+        done
+        exit 1
+      displayName: Verify actual serving image starts and predicts
+    - script: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$(Build.SourcesDirectory)/artifacts:/reports" aquasec/trivy:0.75.0 image --format json --output /reports/image-security.json --exit-code 1 --severity HIGH,CRITICAL iris-api:$(Build.BuildId)
+      displayName: Container vulnerability gate
+    - publish: artifacts
+      condition: succeededOrFailed()
+      artifact: ml-artifacts
+    - publish: dist
+      artifact: python-package
+    - ${{ if eq(parameters.deploy, true) }}:
+      - task: AzureCLI@2
+        displayName: '14 Push image to ACR / 18 Register ML model'
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            az extension add --name ml --upgrade --yes
+            az acr show --name "$(acrName)" --resource-group "$(resourceGroup)" -o none
+            az ml workspace show --name "$(amlWorkspace)" --resource-group "$(resourceGroup)" -o none
+            az acr login --name "$(acrName)"
+            docker tag iris-api:$(Build.BuildId) "$(acrName).azurecr.io/$(imageRepository):$(Build.BuildId)"
+            docker push "$(acrName).azurecr.io/$(imageRepository):$(Build.BuildId)"
+            az ml model create --name iris-classifier --version "$(Build.BuildId)" --type custom_model --path artifacts/model.joblib --resource-group "$(resourceGroup)" --workspace-name "$(amlWorkspace)" --tags "commit=$(Build.SourceVersion)"
+            for file in baseline.csv model.joblib manifest.json; do
+              az storage blob upload --auth-mode login --account-name "$(dataStorageAccount)" --container-name ml-data --name "versions/$(Build.BuildId)/$file" --file "artifacts/$file" --overwrite false
+            done
+
+- stage: Development
+  displayName: '19–25 Deploy development, API, model and test'
+  dependsOn: CI
+  condition: and(succeeded(), eq('${{ lower(parameters.deploy) }}', 'true'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+  - ${{ if eq(parameters.deploy, true) }}:
+    - template: pipelines/deploy.yml
+      parameters:
+        environment: dev
+        appName: mlops-iris-dev
+        title: '19–21 Deploy development FastAPI and bundled ML model'
+  - ${{ else }}:
+    - job: ReleaseNotActivated
+      steps:
+      - script: echo "Enable deploy after Azure resources and private agents are configured."
+- stage: Staging
+  displayName: '26 Deploy QA/Staging'
+  dependsOn: Development
+  jobs:
+  - ${{ if eq(parameters.deploy, true) }}:
+    - template: pipelines/deploy.yml
+      parameters:
+        environment: staging
+        appName: mlops-iris-staging
+        title: '26 Deploy staging and run release gates'
+  - ${{ else }}:
+    - job: ReleaseNotActivated
+      steps:
+      - script: echo "Enable deploy after Azure resources and private agents are configured."
+- stage: Approval
+  displayName: '27 Approval gate'
+  dependsOn: Staging
+  jobs:
+  - job: Review
+    pool: server
+    timeoutInMinutes: 1440
+    steps:
+    - task: ManualValidation@1
+      timeoutInMinutes: 720
+      inputs:
+        notifyUsers: '$(releaseApprovers)'
+        approvers: '$(releaseApprovers)'
+        allowApproversToApproveTheirOwnRuns: false
+        instructions: Review CI model metrics, security reports, staging tests and rollback image digest.
+        onTimeout: reject
+- stage: Production
+  displayName: '28–30 Production deployment, hosting and smoke / 41 CD new model'
+  dependsOn: Approval
+  jobs:
+  - ${{ if eq(parameters.deploy, true) }}:
+    - template: pipelines/deploy.yml
+      parameters:
+        environment: prod
+        appName: mlops-iris-prod
+        title: '28–30 Host FastAPI and smoke-test production'
+  - ${{ else }}:
+    - job: ReleaseNotActivated
+      steps:
+      - script: echo "Enable deploy after Azure resources and private agents are configured."

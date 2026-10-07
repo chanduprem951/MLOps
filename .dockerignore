@@ -1,0 +1,9 @@
+.git
+.venv
+.azure-cli-venv
+__pycache__
+tests
+docs
+dist
+artifacts/*.npz
+artifacts/*.csv

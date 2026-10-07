@@ -1,0 +1,12 @@
+.venv/
+.azure-cli-venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+artifacts/
+dist/
+build/
+*.egg-info/
+.env
+data/current.csv
+data/production.csv
